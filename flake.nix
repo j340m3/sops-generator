@@ -1,115 +1,106 @@
 {
-  description = "A Python Package";
+  description = "Template";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+
     flake-utils.url = "github:numtide/flake-utils";
+
+    pyproject-nix = {
+      url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+
+  outputs =
+    {
+      nixpkgs,
+      flake-utils,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
-        ## Import nixpkgs:
-        pkgs = import nixpkgs { inherit system; };
+        # Define the python version we wish to use
+        python = pkgs.python312;
 
-        ## Read pyproject.toml file:
-        pyproject = builtins.fromTOML (builtins.readFile ./pyproject.toml);
+        # Use pkgs for this "system"
+	pkgs = import nixpkgs {
+	  inherit system;
+	};
+        inherit (pkgs) lib;
 
-        ## Get project specification:
-        project = pyproject.project;
+        # Load a uv workspace from a workspace root.
+        workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
 
-        ## Get the package:
-        package = pkgs.python3Packages.buildPythonPackage {
-          ## Set the package name:
-          pname = project.name;
-
-          ## Inherit the package version:
-          inherit (project) version;
-
-          ## Set the package format:
-          format = "pyproject";
-
-          ## Set the package source:
-          src = ./.;
-
-          ## Specify the build system to use:
-          build-system = with pkgs.python3Packages; [
-            setuptools
-          ];
-
-          ## Specify test dependencies:
-          nativeCheckInputs = [
-            ## Python dependencies:
-            pkgs.python3Packages.mypy
-            pkgs.python3Packages.nox
-            pkgs.python3Packages.pytest
-            pkgs.python3Packages.ruff
-
-            ## Non-Python dependencies:
-            pkgs.taplo
-          ];
-
-          ## Define the check phase:
-          checkPhase = ''
-            runHook preCheck
-            nox
-            runHook postCheck
-          '';
-
-          ## Specify production dependencies:
-          propagatedBuildInputs = [
-            pkgs.python3Packages.click
-          ];
+        # Create package overlay from workspace preferring wheels over sdist.
+        overlay = workspace.mkPyprojectOverlay {
+          sourcePreference = "wheel";
         };
 
-        ## Make our package editable:
-        editablePackage = pkgs.python3.pkgs.mkPythonEditablePackage {
-          pname = project.name;
-          inherit (project) scripts version;
-          root = "$PWD";
+        # Use base package set from pyproject.nix builders.
+        baseSet = pkgs.callPackage pyproject-nix.build.packages {
+          inherit python;
         };
+
+        # Construct a final package set from composing base + overlays
+        pythonSet = baseSet.overrideScope (
+          pkgs.lib.composeManyExtensions [
+            pyproject-build-systems.overlays.default
+            overlay
+            (final: prev: {
+              pyarrow = prev.pyarrow.overrideAttrs (old: {
+                buildInputs = (old.buildInputs or []) ++ [
+                  pkgs.arrow-cpp
+                ];
+                propagatedBuildInputs = (old.propagatedBuildInputs or [] ) ++ [
+                  prev.numpy
+                ];
+                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                  final.setuptools
+                  final.cython
+                  pkgs.cmake
+                ];
+              });
+            })
+          ]
+        );
+
+        # Make a virtualenv from the final package set
+        venv = pythonSet.mkVirtualEnv "venv" workspace.deps.default;
+        inherit (pkgs.callPackages pyproject-nix.build.util { }) mkApplication;
       in
       {
-        ## Project packages output:
-        packages = {
-          "${project.name}" = package;
-          default = self.packages.${system}.${project.name};
+        devShells.default = pkgs.mkShell {
+          packages = [
+            pkgs.jq
+            pkgs.uv
+            venv
+          ];
         };
-
-        ## Project development shell output:
-        devShells = {
-          default = pkgs.mkShell {
-            inputsFrom = [
-              package
-            ];
-
-            buildInputs = [
-              #################
-              ## OUR PACKAGE ##
-              #################
-
-              editablePackage
-
-              #################
-              # VARIOUS TOOLS #
-              #################
-
-              pkgs.python3Packages.build
-              pkgs.python3Packages.ipython
-
-              ####################
-              # EDITOR/LSP TOOLS #
-              ####################
-
-              # LSP server:
-              pkgs.python3Packages.python-lsp-server
-
-              # LSP server plugins of interest:
-              pkgs.python3Packages.pylsp-mypy
-              pkgs.python3Packages.pylsp-rope
-              pkgs.python3Packages.python-lsp-ruff
-            ];
+        packages = {
+          default = mkApplication {
+            venv = venv;
+            package = pythonSet.simple-python-template;
           };
         };
-      });
+      }
+    );
 }
